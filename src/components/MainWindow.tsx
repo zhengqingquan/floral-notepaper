@@ -243,23 +243,20 @@ function applyFormat(
     }
   }
 
+  textarea.focus();
+  textarea.setSelectionRange(0, value.length);
+  document.execCommand("insertText", false, result);
   setContent(result);
   markDirty();
   requestAnimationFrame(() => {
-    textarea.focus();
     textarea.setSelectionRange(cursorStart, cursorEnd);
   });
 }
 
-type UndoDocument = Pick<Document, "execCommand">;
-
-export function runEditorUndo(
-  textarea: HTMLTextAreaElement | null,
-  doc: UndoDocument = document,
-): boolean {
+function runEditorCommand(textarea: HTMLTextAreaElement | null, command: "undo" | "redo"): boolean {
   if (!textarea || textarea.disabled) return false;
   textarea.focus();
-  return doc.execCommand("undo");
+  return document.execCommand(command);
 }
 
 export function pinTileButtonTitle(isPinned: boolean): string {
@@ -1134,7 +1131,16 @@ export function MainWindow({
   const handleUndo = () => {
     if (!selectedId) return;
     const textarea = contentRef.current;
-    if (runEditorUndo(textarea)) {
+    if (runEditorCommand(textarea, "undo")) {
+      setContent(textarea?.value ?? content);
+      markDirty();
+    }
+  };
+
+  const handleRedo = () => {
+    if (!selectedId) return;
+    const textarea = contentRef.current;
+    if (runEditorCommand(textarea, "redo")) {
       setContent(textarea?.value ?? content);
       markDirty();
     }
@@ -1975,6 +1981,32 @@ export function MainWindow({
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     aria-hidden="true"
+                  >
+                    <path d="M9 14 4 9l5-5" />
+                    <path d="M4 9h10a6 6 0 0 1 0 12h-1" />
+                  </svg>
+                </button>
+
+                <button
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={handleRedo}
+                  disabled={!selectedId}
+                  className="w-7 h-7 flex items-center justify-center rounded-lg text-ink-ghost hover:text-ink-faint hover:bg-paper-warm transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                  title={t("main.editor.redo", { defaultValue: "重做（Ctrl+Y）" })}
+                  aria-label={t("main.editor.redoLabel", { defaultValue: "重做" })}
+                >
+                  <svg
+                    data-testid="main-editor-redo-icon"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                    style={{ transform: "scaleX(-1)" }}
                   >
                     <path d="M9 14 4 9l5-5" />
                     <path d="M4 9h10a6 6 0 0 1 0 12h-1" />

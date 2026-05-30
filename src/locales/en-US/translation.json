@@ -67,7 +67,9 @@
       "pinToTile": "Pin to Tile",
       "previewLabel": "Preview",
       "undo": "Undo (Ctrl+Z)",
-      "undoLabel": "Undo"
+      "undoLabel": "Undo",
+      "redo": "Redo (Ctrl+Y)",
+      "redoLabel": "Redo"
     },
     "externalFile": {
       "label": "External File · {{path}}"
