@@ -1001,14 +1001,15 @@ function formatBytes(value: number | null | undefined) {
 function getInstallSuccessMessage(
   result: UpdateInstallResult,
   t: ReturnType<typeof useTranslation>["t"],
-) {
+): string {
+  const tr = t as (key: string, options?: Record<string, unknown>) => string;
   if (result.mode === "test") {
-    return t("settings.update.installValidatedTest", {
+    return tr("settings.update.installValidatedTest", {
       defaultValue: "安装 helper 已完成 test 模式校验",
     });
   }
 
-  return t("settings.update.installValidated", {
+  return tr("settings.update.installValidated", {
     defaultValue: "即将退出应用并安装更新，完成后会自动重新打开",
   });
 }
