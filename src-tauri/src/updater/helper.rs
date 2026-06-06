@@ -8,6 +8,8 @@ use super::{
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -865,6 +867,7 @@ fn install_windows_installer(
                         "/passive",
                         "/norestart",
                     ])
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
                     .spawn()
                     .map_err(|_| UpdateHelperExitCode::InstallerFailed)?;
 
@@ -1643,6 +1646,7 @@ fn backup_windows_registry_state(
             &backup_path.to_string_lossy(),
             "/y",
         ])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .status()
         .map_err(|error| {
             let _ = write_log_line(
@@ -1704,6 +1708,7 @@ fn query_windows_install_record_from_registry(
     ROOTS.iter().find_map(|root| {
         let key_path = Command::new(reg_exe_path())
             .args(["query", root, "/s", "/f", exe_name])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .output()
             .ok()
             .filter(|output| output.status.success())
@@ -1736,6 +1741,7 @@ fn query_windows_install_registry_record(
 ) -> Option<WindowsRegistryInstallRecord> {
     Command::new(reg_exe_path())
         .args(["query", key_path])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -2616,6 +2622,7 @@ fn restore_windows_registry_backup(
     };
     let status = Command::new(reg_exe_path())
         .args(["import", &registry_backup.backup_path.to_string_lossy()])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .status()
         .map_err(|error| {
             let _ = write_log_line(
@@ -2661,6 +2668,7 @@ fn restore_windows_registry_backup(
 fn windows_shell_command(command: &str) -> Command {
     let mut process = Command::new("cmd");
     process.args(["/C", command]);
+    process.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     process.stdin(std::process::Stdio::null());
     process.stdout(std::process::Stdio::null());
     process.stderr(std::process::Stdio::null());
