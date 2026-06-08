@@ -138,6 +138,10 @@ export function NotePad({
   const contentRef = useRef<HTMLTextAreaElement>(null);
   const windowLabelRef = useRef("");
   const statusRef = useRef<NotePadStatus>("empty");
+  const contentValueRef = useRef(content);
+  contentValueRef.current = content;
+  const titleValueRef = useRef(title);
+  titleValueRef.current = title;
   const isStandby = useRef(
     typeof window !== "undefined" &&
       new URLSearchParams(window.location.search).get("standby") === "1",
@@ -316,7 +320,8 @@ export function NotePad({
         : [metadata, ...current];
       return [...next].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
     });
-    setStatus("saved");
+    const contentChanged = contentValueRef.current !== content || titleValueRef.current !== title;
+    setStatus(contentChanged ? "dirty" : "saved");
     return note;
   }, [content, editingNoteId, title]);
 

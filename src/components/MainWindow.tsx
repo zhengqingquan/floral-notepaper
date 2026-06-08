@@ -354,6 +354,10 @@ export function MainWindow({
   saveStateRef.current = saveState;
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const contentValueRef = useRef(content);
+  contentValueRef.current = content;
+  const titleValueRef = useRef(title);
+  titleValueRef.current = title;
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.id === selectedId) ?? null,
@@ -773,6 +777,7 @@ export function MainWindow({
             void getNote(currentId)
               .then((note) => {
                 if (selectedIdRef.current !== currentId) return;
+                if (saveStateRef.current === "dirty") return;
                 setTitle(note.title);
                 setContent(note.content);
                 setSaveState("saved");
@@ -930,7 +935,7 @@ export function MainWindow({
         lastExternalSaveRef.current = Date.now();
         const mtime = await getFileModifiedTime(selectedExternalFile.filePath);
         externalFileMtimeRef.current = mtime;
-        setSaveState("saved");
+        setSaveState(contentValueRef.current === content ? "saved" : "dirty");
         return { id: selectedId, title, content } as Note;
       } catch (error) {
         setSaveState("error");
@@ -944,7 +949,8 @@ export function MainWindow({
       const category = selectedNote?.category ?? "";
       const note = await updateNote(selectedId, { title, content, category });
       replaceNoteMetadata(note);
-      setSaveState("saved");
+      const contentChanged = contentValueRef.current !== content || titleValueRef.current !== title;
+      setSaveState(contentChanged ? "dirty" : "saved");
       return note;
     } catch (error) {
       setSaveState("error");
