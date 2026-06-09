@@ -1891,7 +1891,14 @@ export function MainWindow({
                     : ""}
                 </span>
                 <button
-                  onClick={() => setShowCategoryInput(true)}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    if (showCategoryInput && categoryInputValue.trim()) {
+                      void handleCreateCategory();
+                      return;
+                    }
+                    setShowCategoryInput(true);
+                  }}
                   className="text-[10px] text-ink-ghost hover:text-bamboo transition-colors cursor-pointer"
                   title={t("main.category.new", { defaultValue: "新建分类" })}
                 >
