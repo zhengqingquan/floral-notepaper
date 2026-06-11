@@ -50,6 +50,7 @@
     "imagePasteFailed": "Image paste failed",
     "imageTooLarge": "Image file too large (max 20 MB)",
     "noPool": "Notepad window pool not yet initialized",
+    "notepadOpenBusy": "Opening a notepad, please wait",
     "noteNotFound": "Note not found",
     "unsupportedFile": "Only .md files are supported",
     "unsupportedImageFormat": "Unsupported image format",

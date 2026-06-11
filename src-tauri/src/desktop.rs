@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     error::Error,
     io::Write,
     path::PathBuf,
@@ -569,6 +570,9 @@ enum ShortcutAction {
 #[derive(Default)]
 struct NotepadPool {
     available: Mutex<Vec<String>>,
+    creation_lock: Mutex<()>,
+    replenish_pending: AtomicBool,
+    open_in_progress: AtomicBool,
 }
 
 impl NotepadPool {
@@ -598,6 +602,73 @@ impl NotepadPool {
             .lock()
             .map(|available| available.len())
             .unwrap_or(0)
+    }
+
+    fn try_begin_replenish(&self) -> bool {
+        !self.replenish_pending.swap(true, Ordering::SeqCst)
+    }
+
+    fn finish_replenish(&self) {
+        self.replenish_pending.store(false, Ordering::SeqCst);
+    }
+
+    fn try_begin_open(&self) -> bool {
+        !self.open_in_progress.swap(true, Ordering::SeqCst)
+    }
+
+    fn finish_open(&self) {
+        self.open_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    fn acquire_creation(&self) -> NotepadCreationGuard<'_> {
+        let guard = self
+            .creation_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        NotepadCreationGuard { _lock: guard }
+    }
+}
+
+struct NotepadCreationGuard<'a> {
+    _lock: std::sync::MutexGuard<'a, ()>,
+}
+
+struct NotepadOpenGuard {
+    app: AppHandle,
+    armed: bool,
+}
+
+impl NotepadOpenGuard {
+    fn try_begin(app: &AppHandle) -> Result<Self, AppError> {
+        let pool = app.try_state::<NotepadPool>().ok_or_else(|| AppError {
+            code: "noPool".into(),
+            message: "notepad pool not initialized".into(),
+            details: Default::default(),
+        })?;
+        if !pool.try_begin_open() {
+            log_notepad_pool(Some(app), "open_skip", "reason=open_in_progress");
+            return Err(AppError {
+                code: "notepadOpenBusy".into(),
+                message: "正在打开便签，请稍候".into(),
+                details: Default::default(),
+            });
+        }
+        log_notepad_pool(Some(app), "open_guard_acquire", "phase=begin");
+        Ok(Self {
+            app: app.clone(),
+            armed: true,
+        })
+    }
+}
+
+impl Drop for NotepadOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            log_notepad_pool(Some(&self.app), "open_guard_release", "phase=end");
+            if let Some(pool) = self.app.try_state::<NotepadPool>() {
+                pool.finish_open();
+            }
+        }
     }
 }
 
@@ -630,6 +701,54 @@ fn notepad_webview_counts(app: &AppHandle) -> NotepadWebviewCounts {
         total,
         visible,
         standby,
+    }
+}
+
+fn prewarm_allowed_for_visible(visible: usize) -> bool {
+    visible <= NOTEPAD_POOL_CAPACITY
+}
+
+fn should_prewarm_notepad(app: &AppHandle, pool: &NotepadPool) -> bool {
+    let counts = notepad_webview_counts(app);
+    pool.is_below_capacity()
+        && prewarm_allowed_for_visible(counts.visible)
+        && counts.total < counts.visible.saturating_add(NOTEPAD_POOL_CAPACITY)
+}
+
+fn trim_orphan_hidden_notepads(app: &AppHandle) {
+    let counts = notepad_webview_counts(app);
+    let hidden = counts.total.saturating_sub(counts.visible);
+    if hidden <= counts.standby {
+        return;
+    }
+
+    let standby_labels: HashSet<String> = app
+        .try_state::<NotepadPool>()
+        .and_then(|pool| {
+            pool.available
+                .lock()
+                .ok()
+                .map(|available| available.iter().cloned().collect::<HashSet<_>>())
+        })
+        .unwrap_or_default();
+
+    let mut closed = 0usize;
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with("notepad-") {
+            continue;
+        }
+        if window.is_visible().unwrap_or(true) {
+            continue;
+        }
+        if standby_labels.contains(&label) {
+            continue;
+        }
+        let _ = window.close();
+        closed += 1;
+    }
+
+    if closed > 0 {
+        log_notepad_pool(Some(app), "orphan_trim", &format!("closed={closed}"));
     }
 }
 
@@ -1274,7 +1393,7 @@ pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
     register_configured_global_shortcut(app.handle());
     setup_app_menu(app)?;
     setup_tray(app)?;
-    init_notepad_pool_diagnostic_logging("stage0_diag");
+    init_notepad_pool_diagnostic_logging("stage1_leak_fix_diag");
     schedule_notepad_prewarm(app.handle());
 
     if !std::env::args().any(|a| a == "--silent") {
@@ -1565,6 +1684,12 @@ fn open_notepad_window_now(
     note_id: Option<&str>,
     bounds: Option<WindowBounds>,
 ) -> Result<String, AppError> {
+    let _open_guard = if note_id.is_none() {
+        Some(NotepadOpenGuard::try_begin(app)?)
+    } else {
+        None
+    };
+
     if note_id.is_none() {
         log_notepad_pool(Some(app), "open_try_pool", "phase=activate_pooled");
         if let Some(reused) = activate_pooled_notepad(app, bounds) {
@@ -1587,30 +1712,44 @@ fn open_notepad_window_now(
         None => "index.html?view=notepad".to_string(),
     };
 
-    let opened = open_or_focus_window(
-        app,
-        &label,
-        WindowOpenOptions {
-            url,
-            title: locales::notepad_window_title(locale).to_string(),
-            specs,
-            decorations: false,
-            always_on_top: true,
-            shadow: false,
-            skip_taskbar: true,
-            bounds,
-        },
-    )?;
+    let opts = WindowOpenOptions {
+        url,
+        title: locales::notepad_window_title(locale).to_string(),
+        specs,
+        decorations: false,
+        always_on_top: true,
+        shadow: false,
+        skip_taskbar: true,
+        bounds,
+    };
 
     if note_id.is_none() {
-        log_notepad_pool(Some(app), "open_new", &format!("label={opened}"));
-        log_notepad_pool(
-            Some(app),
-            "open_done",
-            &format!("path=open_new label={opened}"),
-        );
+        if let Some(pool) = app.try_state::<NotepadPool>() {
+            let _creation_guard = pool.acquire_creation();
+            log_notepad_pool(Some(app), "creation_lock_acquired", "path=open_new");
+            log_notepad_pool(Some(app), "open_new_build_begin", &format!("label={label}"));
+            let opened = open_or_focus_window(app, &label, opts)?;
+            log_notepad_pool(Some(app), "open_new_build_end", &format!("label={opened}"));
+            schedule_notepad_replenish(app, 100);
+            log_notepad_pool(Some(app), "open_new", &format!("label={opened}"));
+            log_notepad_pool(
+                Some(app),
+                "open_done",
+                &format!("path=open_new label={opened}"),
+            );
+            return Ok(opened);
+        }
     }
 
+    let opened = open_or_focus_window(app, &label, opts)?;
+    log_notepad_pool(
+        Some(app),
+        "open_done",
+        &format!(
+            "path=open_new_note label={opened} note_id={}",
+            note_id.unwrap_or("none")
+        ),
+    );
     Ok(opened)
 }
 
@@ -1660,6 +1799,8 @@ pub fn recycle_notepad_window(app: &AppHandle, label: &str) -> Result<(), AppErr
         log_notepad_pool(Some(app), "recycle_pooled", &format!("label={label}"));
     }
 
+    trim_orphan_hidden_notepads(app);
+
     Ok(())
 }
 
@@ -1696,13 +1837,35 @@ fn should_save_surface_size_before_close(label: &str) -> bool {
 }
 
 fn schedule_notepad_prewarm(app: &AppHandle) {
-    for i in 0..NOTEPAD_POOL_CAPACITY {
-        let delay = 800 + i as u64 * 400;
-        schedule_notepad_replenish(app, delay);
-    }
+    schedule_notepad_replenish(app, 800);
 }
 
 fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
+    let Some(pool) = app.try_state::<NotepadPool>() else {
+        return;
+    };
+    if !should_prewarm_notepad(app, &pool) {
+        let reason = if !pool.is_below_capacity() {
+            "pool_at_capacity"
+        } else {
+            "too_many_visible"
+        };
+        log_notepad_pool(
+            Some(app),
+            "prewarm_skip",
+            &format!("reason={reason} delay_ms={delay_ms}"),
+        );
+        return;
+    }
+    if !pool.try_begin_replenish() {
+        log_notepad_pool(
+            Some(app),
+            "replenish_skip",
+            &format!("delay_ms={delay_ms} reason=already_pending"),
+        );
+        return;
+    }
+
     log_notepad_pool(
         Some(app),
         "replenish_schedule",
@@ -1713,9 +1876,19 @@ fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let handle_inner = handle.clone();
         let _ = handle.run_on_main_thread(move || {
+            log_notepad_pool(Some(&handle_inner), "prewarm_main_begin", "phase=replenish");
             if let Err(error) = prewarm_notepad(&handle_inner) {
                 eprintln!("failed to replenish notepad pool: {error}");
+                log_notepad_pool(
+                    Some(&handle_inner),
+                    "prewarm_main_err",
+                    &format!("error={error}"),
+                );
             }
+            if let Some(pool) = handle_inner.try_state::<NotepadPool>() {
+                pool.finish_replenish();
+            }
+            log_notepad_pool(Some(&handle_inner), "prewarm_main_end", "phase=replenish");
         });
     });
 }
@@ -1727,6 +1900,14 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
         details: Default::default(),
     })?;
 
+    let _creation_guard = pool.acquire_creation();
+    log_notepad_pool(Some(app), "prewarm_lock_acquired", "phase=prewarm");
+
+    if !should_prewarm_notepad(app, &pool) {
+        log_notepad_pool(Some(app), "prewarm_skip", "reason=too_many_visible");
+        return Ok(());
+    }
+
     if !pool.is_below_capacity() {
         log_notepad_pool(Some(app), "prewarm_skip", "reason=pool_at_capacity");
         return Ok(());
@@ -1737,6 +1918,7 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
     let visual_options = dynamic_window_visual_options(&label);
     let locale = configured_locale();
 
+    log_notepad_pool(Some(app), "prewarm_build_begin", &format!("label={label}"));
     WebviewWindowBuilder::new(
         app,
         &label,
@@ -1754,12 +1936,31 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
     .visible(false)
     .focused(false)
     .build()?;
+    log_notepad_pool(Some(app), "prewarm_build_end", &format!("label={label}"));
 
-    let put_ok = pool.put(label.clone());
-    if put_ok {
-        log_notepad_pool(Some(app), "prewarm_ok", &format!("label={label}"));
+    if !should_prewarm_notepad(app, &pool) {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+        log_notepad_pool(
+            Some(app),
+            "prewarm_abort",
+            &format!("label={label} reason=visible_changed_during_build"),
+        );
+        return Ok(());
+    }
+
+    if !pool.put(label.clone()) {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+        log_notepad_pool(
+            Some(app),
+            "prewarm_leak_closed",
+            &format!("label={label} reason=put_rejected"),
+        );
     } else {
-        log_notepad_pool(Some(app), "prewarm_put_fail", &format!("label={label}"));
+        log_notepad_pool(Some(app), "prewarm_ok", &format!("label={label}"));
     }
 
     Ok(())

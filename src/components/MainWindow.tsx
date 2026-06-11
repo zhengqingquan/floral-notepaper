@@ -429,6 +429,7 @@ export function MainWindow({
   const isExternal = selectedExternalFile !== null;
   const isExternalRef = useRef(isExternal);
   isExternalRef.current = isExternal;
+  const openingNotepadRef = useRef(false);
 
   const noteMenuTarget = useMemo(
     () => notes.find((note) => note.id === noteMenu?.noteId) ?? null,
@@ -1635,10 +1636,14 @@ export function MainWindow({
   };
 
   const handleOpenNotepad = async () => {
+    if (openingNotepadRef.current) return;
+    openingNotepadRef.current = true;
     try {
       await openNotepadWindow();
     } catch (error) {
       showToast(getErrorMessage(error));
+    } finally {
+      openingNotepadRef.current = false;
     }
   };
 
