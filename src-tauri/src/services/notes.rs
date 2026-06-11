@@ -313,6 +313,142 @@ fn data_dir_from_notes_dir(notes_dir: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+const DATA_DIR_ITEMS: [&str; 4] = ["metadata.json", "notes", "images", "backgrounds"];
+
+// 旧版无论 notesDir 指向哪里，metadata.json、images、backgrounds 都固定存放在旧主目录；
+// 数据目录解析到其他位置时必须一并带走，否则笔记内图片引用全部失效、created_at 丢失
+fn migrate_legacy_aux_data(legacy_base_dir: &Path, data_dir: &Path) {
+    for item in ["metadata.json", "images", "backgrounds"] {
+        let src = legacy_base_dir.join(item);
+        let dst = data_dir.join(item);
+        if !src.exists() || dst.exists() {
+            continue;
+        }
+        if let Err(error) = move_path(&src, &dst) {
+            eprintln!(
+                "failed to migrate legacy {item} from {} to {}: {}",
+                legacy_base_dir.display(),
+                data_dir.display(),
+                error.message
+            );
+        }
+    }
+}
+
+// v1.0.4 之前没有 ensure_notes_suffix，自定义笔记目录下 .md 直接位于目录顶层、
+// 分类是顶层子目录；新布局要求笔记位于 data_dir/notes 下，这里按旧 metadata 归位
+fn rescue_loose_legacy_notes(legacy_base_dir: &Path, data_dir: &Path) {
+    let notes_dir = data_dir.join("notes");
+    let tracked = fs::read_to_string(legacy_base_dir.join("metadata.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<MetadataFile>(&content).ok());
+
+    match tracked {
+        Some(metadata) => {
+            for note in &metadata.notes {
+                let (src, dst) = if note.category.is_empty() {
+                    (
+                        data_dir.join(&note.file_name),
+                        notes_dir.join(&note.file_name),
+                    )
+                } else {
+                    (
+                        data_dir.join(&note.category).join(&note.file_name),
+                        notes_dir.join(&note.category).join(&note.file_name),
+                    )
+                };
+                move_loose_note_file(&src, &dst);
+            }
+        }
+        None => {
+            // 旧 metadata 缺失时退化为整层扫描，与旧版重建逻辑一致：所有 .md 均视为笔记
+            move_loose_note_files_in(data_dir, &notes_dir);
+            let Ok(entries) = fs::read_dir(data_dir) else {
+                return;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if matches!(
+                    name.as_str(),
+                    "notes" | "images" | "backgrounds" | "updates"
+                ) {
+                    continue;
+                }
+                move_loose_note_files_in(&path, &notes_dir.join(&name));
+            }
+        }
+    }
+}
+
+fn move_loose_note_files_in(from: &Path, to: &Path) {
+    let Ok(entries) = fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        move_loose_note_file(&path, &to.join(entry.file_name()));
+    }
+}
+
+fn move_loose_note_file(src: &Path, dst: &Path) {
+    if !src.is_file() || dst.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if fs::rename(src, dst).is_err() && fs::copy(src, dst).is_ok() {
+        let _ = fs::remove_file(src);
+    }
+}
+
+fn move_path(src: &Path, dst: &Path) -> Result<(), AppError> {
+    if src.is_dir() {
+        return move_or_copy_dir(src, dst);
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::rename(src, dst).is_err() {
+        fs::copy(src, dst)?;
+        fs::remove_file(src)?;
+    }
+    Ok(())
+}
+
+fn remap_path_prefix(path_str: &str, old_base: &Path, new_base: &Path) -> String {
+    if path_str.is_empty() {
+        return String::new();
+    }
+    match Path::new(path_str).strip_prefix(old_base) {
+        Ok(relative) => new_base.join(relative).to_string_lossy().to_string(),
+        Err(_) => path_str.to_string(),
+    }
+}
+
+// 仅用于路径比较：解析符号链接并统一大小写表示（Windows 上 canonicalize 返回 \\?\ 前缀路径）。
+// 目标路径尚不存在时退而规范化其父目录
+fn canonical_for_compare(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(parent) = fs::canonicalize(parent) {
+            return parent.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn known_data_migration_candidates() -> Vec<PathBuf> {
     known_data_migration_candidates_for(env::var("HOME").ok(), env::var("USERPROFILE").ok())
 }
@@ -910,10 +1046,14 @@ impl NoteStore {
     }
 
     fn migrate_config_from_legacy(&self) -> Result<(), AppError> {
+        self.migrate_config_from_candidates(&known_data_migration_candidates())
+    }
+
+    fn migrate_config_from_candidates(&self, candidates: &[PathBuf]) -> Result<(), AppError> {
         if self.config_path().exists() {
             return Ok(());
         }
-        for old_dir in known_data_migration_candidates() {
+        for old_dir in candidates {
             let old_config = old_dir.join("config.json");
             if !old_config.exists() {
                 continue;
@@ -928,9 +1068,27 @@ impl NoteStore {
             let resolved_data_dir = config
                 .notes_dir
                 .as_deref()
-                .map(|nd| data_dir_from_notes_dir(nd).to_string_lossy().to_string())
-                .unwrap_or_else(|| old_dir.to_string_lossy().to_string());
-            config.data_dir = Some(resolved_data_dir);
+                .map(data_dir_from_notes_dir)
+                .unwrap_or_else(|| old_dir.clone());
+
+            // notesDir 不带 notes 后缀（v1.0.0–v1.0.3 的自定义目录），
+            // 笔记散落在该目录顶层，先归位到 notes/ 子目录
+            let notes_dir_is_loose = config
+                .notes_dir
+                .as_deref()
+                .map(|nd| Path::new(nd) == resolved_data_dir.as_path())
+                .unwrap_or(false);
+            if notes_dir_is_loose {
+                rescue_loose_legacy_notes(old_dir, &resolved_data_dir);
+            }
+
+            if resolved_data_dir != *old_dir {
+                migrate_legacy_aux_data(old_dir, &resolved_data_dir);
+            }
+
+            config.background_image_path =
+                remap_path_prefix(&config.background_image_path, old_dir, &resolved_data_dir);
+            config.data_dir = Some(resolved_data_dir.to_string_lossy().to_string());
             config.notes_dir = None;
             config.last_known_base_dir = None;
             fs::create_dir_all(&self.config_dir)?;
@@ -1132,40 +1290,53 @@ impl NoteStore {
 
     pub fn migrate_data_to(&self, new_data_dir: &Path) -> Result<NoteStore, AppError> {
         is_safe_data_dir(new_data_dir)?;
-        if new_data_dir == self.data_dir {
+        let canonical_new = canonical_for_compare(new_data_dir);
+        let canonical_current = canonical_for_compare(&self.data_dir);
+        if canonical_new == canonical_current {
             return Ok(self.clone());
+        }
+        // 目标位于当前数据目录内部时，notes/images 等会被搬进自己的子目录，
+        // 复制阶段自我递归、清理阶段连带删除新目录，必须拒绝
+        if canonical_new.starts_with(&canonical_current) {
+            return Err(AppError::new(
+                "unsafePath",
+                "新数据目录不能位于当前数据目录内部，请选择其他位置",
+            ));
         }
         fs::create_dir_all(new_data_dir)?;
 
-        fn move_item(src: &Path, dst: &Path) -> Result<(), AppError> {
-            if src.is_dir() {
-                move_or_copy_dir(src, dst)
-            } else if src.is_file() {
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if fs::rename(src, dst).is_err() {
-                    fs::copy(src, dst)?;
-                    fs::remove_file(src)?;
-                }
-                Ok(())
-            } else {
-                Ok(())
-            }
-        }
-
-        for item in ["metadata.json", "notes", "images", "backgrounds"] {
+        // 第一阶段：只复制不删除。中途失败时源数据完好、配置不变，重试时覆盖续传
+        for item in DATA_DIR_ITEMS {
             let src = self.data_dir.join(item);
             let dst = new_data_dir.join(item);
-            if src.exists() {
-                move_item(&src, &dst)?;
+            if !src.exists() {
+                continue;
+            }
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            } else {
+                fs::copy(&src, &dst)?;
             }
         }
 
+        // 第二阶段：切换配置指向新目录（提交点）
         let new_store = NoteStore::new(self.config_dir.clone(), new_data_dir.to_path_buf());
         let mut config = new_store.load_config()?;
+        config.background_image_path =
+            remap_path_prefix(&config.background_image_path, &self.data_dir, new_data_dir);
         config.data_dir = Some(new_data_dir.to_string_lossy().to_string());
         new_store.save_config(config)?;
+
+        // 第三阶段：清理旧位置。失败只会留下冗余副本，不影响新目录的数据
+        for item in DATA_DIR_ITEMS {
+            let src = self.data_dir.join(item);
+            if src.is_dir() {
+                let _ = fs::remove_dir_all(&src);
+            } else if src.is_file() {
+                let _ = fs::remove_file(&src);
+            }
+        }
+
         Ok(new_store)
     }
 }
@@ -1563,6 +1734,230 @@ mod tests {
         assert_eq!(loaded.locale, "zh-CN");
         assert_eq!(loaded.font_size, 14);
         assert_eq!(loaded.surface_font_size, 14);
+    }
+
+    fn legacy_config_json(notes_dir: &Path, background_image_path: &str) -> String {
+        format!(
+            r#"{{
+  "notesDir": "{}",
+  "globalShortcut": "Ctrl+Space",
+  "closeToTray": true,
+  "autostart": false,
+  "defaultViewMode": "split",
+  "backgroundImagePath": "{}"
+}}"#,
+            notes_dir.to_string_lossy().replace('\\', "\\\\"),
+            background_image_path.replace('\\', "\\\\")
+        )
+    }
+
+    #[test]
+    fn migrates_legacy_aux_data_when_notes_dir_was_customized() {
+        let root = test_root("legacy-aux-migration");
+        let old_dir = root.join("old-base");
+        let custom_dir = root.join("custom");
+        let custom_notes = custom_dir.join("notes");
+        fs::create_dir_all(&custom_notes).expect("create custom notes dir");
+        fs::write(custom_notes.join("id-1_笔记.md"), "# 标题\n内容").expect("write note");
+
+        fs::create_dir_all(old_dir.join("images").join("id-1")).expect("create images dir");
+        fs::write(old_dir.join("images").join("id-1").join("p.png"), b"png").expect("write image");
+        fs::create_dir_all(old_dir.join("backgrounds")).expect("create backgrounds dir");
+        fs::write(old_dir.join("backgrounds").join("bg-1.png"), b"bg").expect("write background");
+        fs::write(old_dir.join("metadata.json"), r#"{"notes":[]}"#).expect("write metadata");
+        let old_background = old_dir.join("backgrounds").join("bg-1.png");
+        fs::write(
+            old_dir.join("config.json"),
+            legacy_config_json(&custom_notes, &old_background.to_string_lossy()),
+        )
+        .expect("write legacy config");
+
+        let store = NoteStore::new(root.join("appdata"), custom_dir.clone());
+        store
+            .migrate_config_from_candidates(&[old_dir.clone()])
+            .expect("migrate legacy config");
+
+        assert!(custom_dir.join("metadata.json").exists());
+        assert!(custom_dir
+            .join("images")
+            .join("id-1")
+            .join("p.png")
+            .exists());
+        assert!(custom_dir.join("backgrounds").join("bg-1.png").exists());
+        assert!(!old_dir.join("metadata.json").exists());
+        assert!(!old_dir.join("images").exists());
+        assert!(!old_dir.join("backgrounds").exists());
+
+        let migrated: AppConfig =
+            serde_json::from_str(&fs::read_to_string(store.config_path()).expect("read config"))
+                .expect("parse migrated config");
+        assert_eq!(
+            migrated.data_dir.as_deref(),
+            Some(custom_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            migrated.background_image_path,
+            custom_dir
+                .join("backgrounds")
+                .join("bg-1.png")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn rescues_loose_notes_from_pre_suffix_custom_dir() {
+        let root = test_root("legacy-loose-notes");
+        let old_dir = root.join("old-base");
+        // v1.0.0–v1.0.3 自定义目录不带 notes 后缀，笔记直接位于目录顶层
+        let custom_dir = root.join("custom");
+        fs::create_dir_all(custom_dir.join("工作")).expect("create category dir");
+        fs::write(custom_dir.join("id-1_第一篇.md"), "# 第一篇").expect("write loose note");
+        fs::write(custom_dir.join("工作").join("id-2_第二篇.md"), "# 第二篇")
+            .expect("write category note");
+        fs::write(custom_dir.join("无关文件.md"), "未被跟踪").expect("write untracked file");
+
+        fs::create_dir_all(&old_dir).expect("create old base");
+        fs::write(
+            old_dir.join("metadata.json"),
+            r#"{"notes":[
+  {"id":"id-1","title":"第一篇","fileName":"id-1_第一篇.md","category":"","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z","wordCount":3,"preview":"第一篇"},
+  {"id":"id-2","title":"第二篇","fileName":"id-2_第二篇.md","category":"工作","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","wordCount":3,"preview":"第二篇"}
+]}"#,
+        )
+        .expect("write legacy metadata");
+        fs::write(
+            old_dir.join("config.json"),
+            legacy_config_json(&custom_dir, ""),
+        )
+        .expect("write legacy config");
+
+        let store = NoteStore::new(root.join("appdata"), custom_dir.clone());
+        store
+            .migrate_config_from_candidates(&[old_dir.clone()])
+            .expect("migrate legacy config");
+
+        assert!(custom_dir.join("notes").join("id-1_第一篇.md").exists());
+        assert!(custom_dir
+            .join("notes")
+            .join("工作")
+            .join("id-2_第二篇.md")
+            .exists());
+        assert!(!custom_dir.join("id-1_第一篇.md").exists());
+        // metadata 未跟踪的文件留在原处
+        assert!(custom_dir.join("无关文件.md").exists());
+        // metadata.json 一并迁入新数据目录，created_at 不丢失
+        assert!(custom_dir.join("metadata.json").exists());
+
+        let notes = store.list_notes().expect("list notes after migration");
+        assert_eq!(notes.len(), 2);
+        let first = notes
+            .iter()
+            .find(|note| note.id == "id-1")
+            .expect("find first note");
+        assert_eq!(first.created_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn rescues_loose_notes_by_scanning_when_metadata_missing() {
+        let root = test_root("legacy-loose-notes-scan");
+        let old_dir = root.join("old-base");
+        let custom_dir = root.join("custom");
+        fs::create_dir_all(custom_dir.join("分类")).expect("create category dir");
+        fs::write(custom_dir.join("id-1_散落.md"), "# 散落").expect("write loose note");
+        fs::write(custom_dir.join("分类").join("id-2_归类.md"), "# 归类")
+            .expect("write category note");
+
+        fs::create_dir_all(&old_dir).expect("create old base");
+        fs::write(
+            old_dir.join("config.json"),
+            legacy_config_json(&custom_dir, ""),
+        )
+        .expect("write legacy config");
+
+        let store = NoteStore::new(root.join("appdata"), custom_dir.clone());
+        store
+            .migrate_config_from_candidates(&[old_dir.clone()])
+            .expect("migrate legacy config");
+
+        assert!(custom_dir.join("notes").join("id-1_散落.md").exists());
+        assert!(custom_dir
+            .join("notes")
+            .join("分类")
+            .join("id-2_归类.md")
+            .exists());
+    }
+
+    #[test]
+    fn migrate_data_to_moves_items_and_updates_config() {
+        let root = test_root("migrate-data-dir");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let store = NoteStore::new(config_dir.clone(), data_dir.clone());
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        write_json_atomic(&store.config_path(), &store.default_config())
+            .expect("write default config");
+        let note = store
+            .create_note(SaveNoteRequest {
+                title: "迁移测试".into(),
+                content: "# 迁移测试\n正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        let target = root.join("target");
+        let new_store = store.migrate_data_to(&target).expect("migrate data dir");
+
+        assert_eq!(new_store.data_dir(), target.as_path());
+        assert!(target.join("metadata.json").exists());
+        assert!(target.join("notes").exists());
+        assert!(!data_dir.join("metadata.json").exists());
+        assert!(!data_dir.join("notes").exists());
+
+        let notes = new_store.list_notes().expect("list notes after migration");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note.id);
+
+        let config: AppConfig =
+            serde_json::from_str(&fs::read_to_string(store.config_path()).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            config.data_dir.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn migrate_data_to_rejects_target_inside_current_data_dir() {
+        let root = test_root("migrate-nested-reject");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let store = NoteStore::new(config_dir.clone(), data_dir.clone());
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        write_json_atomic(&store.config_path(), &store.default_config())
+            .expect("write default config");
+        store
+            .create_note(SaveNoteRequest {
+                title: "防护测试".into(),
+                content: "正文".into(),
+                category: String::new(),
+            })
+            .expect("create note");
+
+        let error = store
+            .migrate_data_to(&data_dir.join("notes").join("floral"))
+            .expect_err("target inside data dir must be rejected");
+        assert_eq!(error.code, "unsafePath");
+
+        // 数据未被破坏，配置仍指向原目录
+        assert!(data_dir.join("notes").exists());
+        assert!(data_dir.join("metadata.json").exists());
+        let config: AppConfig =
+            serde_json::from_str(&fs::read_to_string(store.config_path()).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            config.data_dir.as_deref(),
+            Some(data_dir.to_string_lossy().as_ref())
+        );
     }
 
     #[cfg(target_os = "macos")]
