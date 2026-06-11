@@ -430,6 +430,8 @@ const TRAY_QUIT_ID: &str = "quit";
 #[cfg(target_os = "macos")]
 static FULLSCREEN_HIDING: AtomicBool = AtomicBool::new(false);
 const NOTEPAD_POOL_CAPACITY: usize = 2;
+/// 连续 WebView build 之间的最小间隔（Windows WebView2 快速连建会挂死主线程）
+const NOTEPAD_WEBVIEW_CREATE_COOLDOWN_MS: u64 = 400;
 
 /// Stores the file path passed as a command-line argument on cold start.
 /// The frontend retrieves and clears this value after initialization via
@@ -576,6 +578,7 @@ struct NotepadPool {
     open_in_progress: AtomicBool,
     quick_open_dispatch_active: AtomicBool,
     quick_open_pending_count: AtomicU8,
+    last_webview_created_at: Mutex<Option<Instant>>,
     deferred_drain_scheduled: AtomicBool,
 }
 
@@ -663,6 +666,27 @@ impl NotepadPool {
 
     fn quick_open_pending_count(&self) -> u8 {
         self.quick_open_pending_count.load(Ordering::SeqCst)
+    }
+
+    fn creation_cooldown_remaining(&self) -> Option<std::time::Duration> {
+        let last = self
+            .last_webview_created_at
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)?;
+        let cooldown = std::time::Duration::from_millis(NOTEPAD_WEBVIEW_CREATE_COOLDOWN_MS);
+        let elapsed = last.elapsed();
+        if elapsed >= cooldown {
+            None
+        } else {
+            Some(cooldown - elapsed)
+        }
+    }
+
+    fn mark_webview_created(&self) {
+        if let Ok(mut last) = self.last_webview_created_at.lock() {
+            *last = Some(Instant::now());
+        }
     }
 
     fn try_schedule_deferred_drain(&self) -> bool {
@@ -878,6 +902,20 @@ fn drain_deferred_quick_notepad_open(app: &AppHandle) {
             }
             return;
         }
+        if let Some(remaining) = pool.creation_cooldown_remaining() {
+            if pool.quick_open_pending_count() > 0 {
+                log_notepad_pool(
+                    Some(app),
+                    "open_skip",
+                    &format!(
+                        "reason=creation_cooldown remain_ms={} chain={chain}",
+                        remaining.as_millis()
+                    ),
+                );
+                schedule_deferred_notepad_drain(app, remaining);
+            }
+            return;
+        }
         if !pool.take_quick_open_pending() {
             return;
         }
@@ -944,7 +982,15 @@ fn schedule_deferred_notepad_drain(app: &AppHandle, delay: std::time::Duration) 
 }
 
 fn schedule_deferred_notepad_drain_from_pool(app: &AppHandle) {
-    schedule_deferred_notepad_drain(app, std::time::Duration::from_millis(50));
+    let delay = app
+        .try_state::<NotepadPool>()
+        .and_then(|pool| pool.creation_cooldown_remaining())
+        .unwrap_or_else(|| std::time::Duration::from_millis(NOTEPAD_WEBVIEW_CREATE_COOLDOWN_MS));
+    schedule_deferred_notepad_drain(app, delay);
+}
+
+fn should_defer_quick_open_for_cooldown(pool: &NotepadPool) -> bool {
+    pool.standby_count() == 0 && pool.creation_cooldown_remaining().is_some()
 }
 
 fn run_quick_notepad_open_on_main(app: &AppHandle, bounds: Option<WindowBounds>) {
@@ -996,6 +1042,22 @@ fn dispatch_quick_notepad_open(app: &AppHandle, bounds: Option<WindowBounds>) {
             "prewarm_in_progress"
         };
         log_notepad_pool(Some(app), "open_skip", &format!("reason={reason}"));
+        return;
+    }
+
+    if should_defer_quick_open_for_cooldown(&pool) {
+        pool.note_quick_open_pending();
+        if let Some(remaining) = pool.creation_cooldown_remaining() {
+            log_notepad_pool(
+                Some(app),
+                "open_skip",
+                &format!(
+                    "reason=creation_cooldown remain_ms={}",
+                    remaining.as_millis()
+                ),
+            );
+            schedule_deferred_notepad_drain(app, remaining);
+        }
         return;
     }
 
@@ -1662,7 +1724,7 @@ pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
     register_configured_global_shortcut(app.handle());
     setup_app_menu(app)?;
     setup_tray(app)?;
-    init_notepad_pool_diagnostic_logging("stage2_deadlock_fix_diag");
+    init_notepad_pool_diagnostic_logging("stage3_cooldown_fix_diag");
     schedule_notepad_prewarm(app.handle());
 
     if !std::env::args().any(|a| a == "--silent") {
@@ -1994,6 +2056,23 @@ fn open_notepad_window_now(
 
     if note_id.is_none() {
         if let Some(pool) = app.try_state::<NotepadPool>() {
+            if let Some(remaining) = pool.creation_cooldown_remaining() {
+                pool.note_quick_open_pending();
+                log_notepad_pool(
+                    Some(app),
+                    "creation_cooldown",
+                    &format!(
+                        "path=open_new remain_ms={} action=defer",
+                        remaining.as_millis()
+                    ),
+                );
+                schedule_deferred_notepad_drain(app, remaining);
+                return Err(AppError {
+                    code: "notepadCreationBusy".into(),
+                    message: "便签窗口创建中，请稍候".into(),
+                    details: Default::default(),
+                });
+            }
             log_notepad_pool(Some(app), "creation_lock_try", "path=open_new");
             let _creation_guard = match pool.try_acquire_creation() {
                 Ok(guard) => {
@@ -2018,6 +2097,7 @@ fn open_notepad_window_now(
             log_notepad_pool(Some(app), "open_new_build_begin", &format!("label={label}"));
             let opened = open_or_focus_window(app, &label, opts)?;
             log_notepad_pool(Some(app), "open_new_build_end", &format!("label={opened}"));
+            pool.mark_webview_created();
             show_and_activate_notepad(app, &opened);
             let counts = notepad_webview_counts(app);
             if prewarm_allowed_for_visible(counts.visible) {
@@ -2195,6 +2275,19 @@ fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
         let handle_inner = handle.clone();
         let _ = handle.run_on_main_thread(move || {
             log_notepad_pool(Some(&handle_inner), "prewarm_main_begin", "phase=replenish");
+            if let Some(pool) = handle_inner.try_state::<NotepadPool>() {
+                if let Some(remaining) = pool.creation_cooldown_remaining() {
+                    pool.finish_replenish();
+                    log_notepad_pool(
+                        Some(&handle_inner),
+                        "prewarm_defer_cooldown",
+                        &format!("remain_ms={}", remaining.as_millis()),
+                    );
+                    schedule_notepad_replenish(&handle_inner, remaining.as_millis() as u64 + 20);
+                    run_deferred_quick_notepad_open_after_prewarm(&handle_inner);
+                    return;
+                }
+            }
             if let Err(error) = prewarm_notepad(&handle_inner) {
                 eprintln!("failed to replenish notepad pool: {error}");
                 log_notepad_pool(
@@ -2256,6 +2349,7 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
     .focused(false)
     .build()?;
     log_notepad_pool(Some(app), "prewarm_build_end", &format!("label={label}"));
+    pool.mark_webview_created();
 
     if !should_prewarm_notepad(app, &pool) {
         if let Some(window) = app.get_webview_window(&label) {
