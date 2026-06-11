@@ -9,7 +9,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Mutex, OnceLock,
     },
     time::Instant,
@@ -571,8 +571,12 @@ enum ShortcutAction {
 struct NotepadPool {
     available: Mutex<Vec<String>>,
     creation_lock: Mutex<()>,
+    creation_in_progress: AtomicBool,
     replenish_pending: AtomicBool,
     open_in_progress: AtomicBool,
+    quick_open_dispatch_active: AtomicBool,
+    quick_open_pending_count: AtomicU8,
+    deferred_drain_scheduled: AtomicBool,
 }
 
 impl NotepadPool {
@@ -620,17 +624,98 @@ impl NotepadPool {
         self.open_in_progress.store(false, Ordering::SeqCst);
     }
 
+    fn try_begin_quick_open_dispatch(&self) -> bool {
+        self.quick_open_dispatch_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn finish_quick_open_dispatch(&self) {
+        self.quick_open_dispatch_active
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn note_quick_open_pending(&self) {
+        let _ = self.quick_open_pending_count.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |count| {
+                if count == u8::MAX {
+                    None
+                } else {
+                    Some(count.saturating_add(1))
+                }
+            },
+        );
+    }
+
+    fn take_quick_open_pending(&self) -> bool {
+        self.quick_open_pending_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count > 0 {
+                    Some(count - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    fn quick_open_pending_count(&self) -> u8 {
+        self.quick_open_pending_count.load(Ordering::SeqCst)
+    }
+
+    fn try_schedule_deferred_drain(&self) -> bool {
+        self.deferred_drain_scheduled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn finish_deferred_drain_schedule(&self) {
+        self.deferred_drain_scheduled.store(false, Ordering::SeqCst);
+    }
+
+    fn is_creation_busy(&self) -> bool {
+        self.creation_in_progress.load(Ordering::SeqCst)
+    }
+
+    fn try_acquire_creation(&self) -> Result<NotepadCreationGuard<'_>, ()> {
+        match self.creation_lock.try_lock() {
+            Ok(guard) => {
+                self.creation_in_progress.store(true, Ordering::SeqCst);
+                Ok(NotepadCreationGuard {
+                    pool: self,
+                    _lock: guard,
+                })
+            }
+            Err(_) => Err(()),
+        }
+    }
+
     fn acquire_creation(&self) -> NotepadCreationGuard<'_> {
         let guard = self
             .creation_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        NotepadCreationGuard { _lock: guard }
+        self.creation_in_progress.store(true, Ordering::SeqCst);
+        NotepadCreationGuard {
+            pool: self,
+            _lock: guard,
+        }
     }
 }
 
 struct NotepadCreationGuard<'a> {
+    pool: &'a NotepadPool,
     _lock: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for NotepadCreationGuard<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .creation_in_progress
+            .store(false, Ordering::SeqCst);
+    }
 }
 
 struct NotepadOpenGuard {
@@ -749,6 +834,190 @@ fn trim_orphan_hidden_notepads(app: &AppHandle) {
 
     if closed > 0 {
         log_notepad_pool(Some(app), "orphan_trim", &format!("closed={closed}"));
+    }
+}
+
+fn drain_standby_notepad_pool(app: &AppHandle) {
+    let Some(pool) = app.try_state::<NotepadPool>() else {
+        return;
+    };
+    let mut closed = 0usize;
+    while let Some(label) = pool.take() {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.close();
+        }
+        closed += 1;
+    }
+    if closed > 0 {
+        log_notepad_pool(Some(app), "pool_drain", &format!("closed={closed}"));
+    }
+}
+
+fn quick_notepad_open_bounds(app: &AppHandle) -> Option<WindowBounds> {
+    if load_config()
+        .map(|config| config.open_at_cursor)
+        .unwrap_or(true)
+    {
+        let specs = saved_surface_specs(app);
+        cursor_centered_bounds(&specs)
+    } else {
+        None
+    }
+}
+
+const QUICK_NOTEPAD_DEFERRED_CHAIN_MAX: usize = 4;
+
+fn drain_deferred_quick_notepad_open(app: &AppHandle) {
+    for chain in 0..QUICK_NOTEPAD_DEFERRED_CHAIN_MAX {
+        let Some(pool) = app.try_state::<NotepadPool>() else {
+            return;
+        };
+        if pool.is_creation_busy() {
+            if pool.quick_open_pending_count() > 0 {
+                schedule_deferred_notepad_drain(app, std::time::Duration::from_millis(50));
+            }
+            return;
+        }
+        if !pool.take_quick_open_pending() {
+            return;
+        }
+        log_notepad_pool(
+            Some(app),
+            "main_open_deferred",
+            &format!("reason=chain chain={chain}"),
+        );
+        let bounds = quick_notepad_open_bounds(app);
+        match open_notepad_window_now(app, None, bounds) {
+            Ok(label) => log_notepad_pool(
+                Some(app),
+                "main_open_ok",
+                &format!("label={label} source=deferred_chain"),
+            ),
+            Err(error) => {
+                log_notepad_pool(
+                    Some(app),
+                    "main_open_err",
+                    &format!(
+                        "source=deferred_chain code={} msg={}",
+                        error.code, error.message
+                    ),
+                );
+                if error.code == "notepadCreationBusy" {
+                    pool.note_quick_open_pending();
+                    schedule_deferred_notepad_drain_from_pool(app);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn run_deferred_quick_notepad_open_after_prewarm(app: &AppHandle) {
+    drain_deferred_quick_notepad_open(app);
+}
+
+fn schedule_deferred_notepad_drain(app: &AppHandle, delay: std::time::Duration) {
+    let Some(pool) = app.try_state::<NotepadPool>() else {
+        return;
+    };
+    if !pool.try_schedule_deferred_drain() {
+        return;
+    }
+    let delay_ms = delay.as_millis().max(1) as u64;
+    log_notepad_pool(
+        Some(app),
+        "deferred_drain_schedule",
+        &format!("delay_ms={delay_ms}"),
+    );
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let handle_inner = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(pool) = handle_inner.try_state::<NotepadPool>() {
+                pool.finish_deferred_drain_schedule();
+            }
+            log_notepad_pool(Some(&handle_inner), "deferred_drain_wakeup", "");
+            drain_deferred_quick_notepad_open(&handle_inner);
+        });
+    });
+}
+
+fn schedule_deferred_notepad_drain_from_pool(app: &AppHandle) {
+    schedule_deferred_notepad_drain(app, std::time::Duration::from_millis(50));
+}
+
+fn run_quick_notepad_open_on_main(app: &AppHandle, bounds: Option<WindowBounds>) {
+    log_notepad_pool(Some(app), "main_open_begin", "source=shortcut_or_tray");
+    let mut defer_after_prewarm = false;
+    match open_notepad_window_now(app, None, bounds) {
+        Ok(label) => log_notepad_pool(Some(app), "main_open_ok", &format!("label={label}")),
+        Err(error) => {
+            log_notepad_pool(
+                Some(app),
+                "main_open_err",
+                &format!("code={} msg={}", error.code, error.message),
+            );
+            defer_after_prewarm = error.code == "notepadCreationBusy";
+        }
+    }
+    if let Some(pool) = app.try_state::<NotepadPool>() {
+        if defer_after_prewarm {
+            log_notepad_pool(
+                Some(app),
+                "main_open_defer",
+                "reason=creation_lock_busy await_prewarm",
+            );
+            schedule_deferred_notepad_drain_from_pool(app);
+        } else {
+            drain_deferred_quick_notepad_open(app);
+        }
+        pool.finish_quick_open_dispatch();
+        log_notepad_pool(Some(app), "main_open_dispatch_done", "phase=end");
+    }
+}
+
+fn dispatch_quick_notepad_open(app: &AppHandle, bounds: Option<WindowBounds>) {
+    let Some(pool) = app.try_state::<NotepadPool>() else {
+        log_notepad_pool(Some(app), "dispatch_skip", "reason=no_pool");
+        return;
+    };
+
+    if pool.is_creation_busy()
+        || pool.open_in_progress.load(Ordering::SeqCst)
+        || (pool.replenish_pending.load(Ordering::SeqCst) && pool.standby_count() == 0)
+    {
+        pool.note_quick_open_pending();
+        let reason = if pool.is_creation_busy() {
+            "creation_in_progress"
+        } else if pool.open_in_progress.load(Ordering::SeqCst) {
+            "open_in_progress"
+        } else {
+            "prewarm_in_progress"
+        };
+        log_notepad_pool(Some(app), "open_skip", &format!("reason={reason}"));
+        return;
+    }
+
+    if !pool.try_begin_quick_open_dispatch() {
+        pool.note_quick_open_pending();
+        log_notepad_pool(Some(app), "open_skip", "reason=dispatch_coalesced");
+        return;
+    }
+
+    log_notepad_pool(Some(app), "dispatch_begin", "action=run_on_main_thread");
+    let app = app.clone();
+    let app_for_main = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || {
+        run_quick_notepad_open_on_main(&app_for_main, bounds);
+    }) {
+        eprintln!("failed to dispatch quick notepad open: {error}");
+        log_notepad_pool(Some(&app), "dispatch_fail", &format!("error={error}"));
+        if let Some(pool) = app.try_state::<NotepadPool>() {
+            pool.finish_quick_open_dispatch();
+        }
+    } else {
+        log_notepad_pool(Some(&app), "dispatch_queued", "action=run_on_main_thread");
     }
 }
 
@@ -1393,7 +1662,7 @@ pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
     register_configured_global_shortcut(app.handle());
     setup_app_menu(app)?;
     setup_tray(app)?;
-    init_notepad_pool_diagnostic_logging("stage1_leak_fix_diag");
+    init_notepad_pool_diagnostic_logging("stage2_deadlock_fix_diag");
     schedule_notepad_prewarm(app.handle());
 
     if !std::env::args().any(|a| a == "--silent") {
@@ -1579,7 +1848,7 @@ fn handle_tray_menu_event(app: &AppHandle, id: &str) -> Result<(), Box<dyn Error
     match tray_menu_action(id) {
         Some(TrayMenuAction::ShowMain) => show_main_window(app)?,
         Some(TrayMenuAction::QuickNote) => {
-            open_notepad_window_now(app, None, None)?;
+            dispatch_quick_notepad_open(app, None);
         }
         Some(TrayMenuAction::ToggleCloseToTray) => {
             let config = toggle_close_to_tray(app)?;
@@ -1725,12 +1994,42 @@ fn open_notepad_window_now(
 
     if note_id.is_none() {
         if let Some(pool) = app.try_state::<NotepadPool>() {
-            let _creation_guard = pool.acquire_creation();
-            log_notepad_pool(Some(app), "creation_lock_acquired", "path=open_new");
+            log_notepad_pool(Some(app), "creation_lock_try", "path=open_new");
+            let _creation_guard = match pool.try_acquire_creation() {
+                Ok(guard) => {
+                    log_notepad_pool(Some(app), "creation_lock_acquired", "path=open_new");
+                    guard
+                }
+                Err(()) => {
+                    pool.note_quick_open_pending();
+                    log_notepad_pool(
+                        Some(app),
+                        "creation_lock_busy",
+                        "path=open_new action=defer",
+                    );
+                    schedule_deferred_notepad_drain_from_pool(app);
+                    return Err(AppError {
+                        code: "notepadCreationBusy".into(),
+                        message: "便签窗口创建中，请稍候".into(),
+                        details: Default::default(),
+                    });
+                }
+            };
             log_notepad_pool(Some(app), "open_new_build_begin", &format!("label={label}"));
             let opened = open_or_focus_window(app, &label, opts)?;
             log_notepad_pool(Some(app), "open_new_build_end", &format!("label={opened}"));
-            schedule_notepad_replenish(app, 100);
+            show_and_activate_notepad(app, &opened);
+            let counts = notepad_webview_counts(app);
+            if prewarm_allowed_for_visible(counts.visible) {
+                schedule_notepad_replenish(app, 100);
+            } else {
+                log_notepad_pool(
+                    Some(app),
+                    "prewarm_skip",
+                    "reason=too_many_visible source=open_new_no_replenish",
+                );
+                drain_standby_notepad_pool(app);
+            }
             log_notepad_pool(Some(app), "open_new", &format!("label={opened}"));
             log_notepad_pool(
                 Some(app),
@@ -1753,6 +2052,17 @@ fn open_notepad_window_now(
     Ok(opened)
 }
 
+fn show_and_activate_notepad(app: &AppHandle, label: &str) {
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    log_notepad_pool(Some(app), "activate_show_begin", &format!("label={label}"));
+    let _ = window.show();
+    log_notepad_pool(Some(app), "activate_emit_begin", &format!("label={label}"));
+    let _ = window.emit("notepad:activate", label.to_string());
+    log_notepad_pool(Some(app), "activate_emit_end", &format!("label={label}"));
+}
+
 fn activate_pooled_notepad(app: &AppHandle, bounds: Option<WindowBounds>) -> Option<String> {
     let pool = app.try_state::<NotepadPool>()?;
     let label = pool.take()?;
@@ -1764,11 +2074,19 @@ fn activate_pooled_notepad(app: &AppHandle, bounds: Option<WindowBounds>) -> Opt
     let _ = window.set_title(locales::notepad_window_title(locale));
     let _ = window.set_size(tauri::LogicalSize::new(specs.width, specs.height));
     let _ = apply_window_bounds(&window, bounds);
-    let _ = window.show();
-    let _ = window.set_focus();
-    let _ = window.emit("notepad:activate", label.clone());
+    show_and_activate_notepad(app, &label);
 
-    schedule_notepad_replenish(app, 100);
+    let counts = notepad_webview_counts(app);
+    if prewarm_allowed_for_visible(counts.visible) {
+        schedule_notepad_replenish(app, 100);
+    } else {
+        log_notepad_pool(
+            Some(app),
+            "prewarm_skip",
+            "reason=too_many_visible source=activate_no_replenish",
+        );
+        drain_standby_notepad_pool(app);
+    }
 
     log_notepad_pool(Some(app), "activate_pooled", &format!("label={label}"));
     Some(label)
@@ -1889,6 +2207,7 @@ fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
                 pool.finish_replenish();
             }
             log_notepad_pool(Some(&handle_inner), "prewarm_main_end", "phase=replenish");
+            run_deferred_quick_notepad_open_after_prewarm(&handle_inner);
         });
     });
 }
@@ -2303,22 +2622,13 @@ fn setup_global_shortcut_plugin(app: &AppHandle) -> tauri::Result<()> {
                         }
                     }
                     ShortcutAction::OpenNotepad => {
-                        log_notepad_pool(Some(app), "shortcut_open_pressed", "action=open_notepad");
-                        let bounds = if load_config().map(|c| c.open_at_cursor).unwrap_or(true) {
-                            let specs = saved_surface_specs(app);
-                            cursor_centered_bounds(&specs)
-                        } else {
-                            None
-                        };
-                        if let Err(error) = app.run_on_main_thread(move || {
-                            if let Err(error) =
-                                open_notepad_window_now(&app_for_closure, None, bounds)
-                            {
-                                eprintln!("failed to open notepad from global shortcut: {error}");
-                            }
-                        }) {
-                            eprintln!("failed to dispatch global shortcut action: {error}");
-                        }
+                        log_notepad_pool(
+                            Some(app),
+                            "shortcut_open_pressed",
+                            "source=global_shortcut",
+                        );
+                        let bounds = quick_notepad_open_bounds(app);
+                        dispatch_quick_notepad_open(app, bounds);
                     }
                 }
             })

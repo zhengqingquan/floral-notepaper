@@ -50,6 +50,7 @@
     "imagePasteFailed": "圖片貼上失敗",
     "imageTooLarge": "圖片檔案過大（上限 20 MB）",
     "noPool": "便箋視窗池尚未初始化",
+    "notepadCreationBusy": "便箋視窗建立中，請稍候",
     "notepadOpenBusy": "正在開啟便箋，請稍候",
     "noteNotFound": "找不到該筆記",
     "unsupportedFile": "僅支援匯入 .md 檔案",

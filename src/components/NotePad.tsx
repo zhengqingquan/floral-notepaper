@@ -289,9 +289,9 @@ export function NotePad({
       setIsExiting(false);
       setSurfaceMode("pad");
       void refreshNotes().catch(() => undefined);
-      void showCurrentWindow()
-        .then(() => contentRef.current?.focus())
-        .catch(() => undefined);
+      requestAnimationFrame(() => {
+        contentRef.current?.focus();
+      });
     });
     return () => {
       void unlisten.then((fn) => fn());

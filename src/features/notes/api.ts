@@ -18,6 +18,7 @@ const LOCALIZED_ERROR_CODES = new Set([
   "desktopConfig",
   "duplicateShortcut",
   "noPool",
+  "notepadCreationBusy",
   "notepadOpenBusy",
   "noteNotFound",
   "unsupportedFile",
@@ -181,6 +182,10 @@ function getLocalizedAppErrorMessage(
     case "notepadOpenBusy":
       return translate("errors.notepadOpenBusy", {
         defaultValue: "正在打开便签，请稍候",
+      });
+    case "notepadCreationBusy":
+      return translate("errors.notepadCreationBusy", {
+        defaultValue: "便签窗口创建中，请稍候",
       });
     default:
       return null;
