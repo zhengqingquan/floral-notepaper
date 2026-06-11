@@ -66,3 +66,6 @@ temp/
 nul
 tsconfig.tsbuildinfo
 Docs/windows-install-chain-code-review.md
+
+## Diagnostic comparison builds (exe not committed)
+builds/diag-comparison/**/*.exe

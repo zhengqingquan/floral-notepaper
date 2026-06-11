@@ -334,7 +334,7 @@ fn cli_version_or_help_requested() -> bool {
 }
 
 #[cfg(windows)]
-fn ensure_console() {
+pub(crate) fn ensure_console() {
     use windows_sys::Win32::System::Console::{AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS};
 
     unsafe {

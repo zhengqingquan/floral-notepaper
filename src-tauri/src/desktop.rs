@@ -3,14 +3,15 @@ use crate::{
     services::notes::{default_store, AppConfig, AppError},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
-use std::sync::OnceLock;
 use std::{
     error::Error,
+    io::Write,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
+    time::Instant,
 };
 
 #[cfg(target_os = "windows")]
@@ -591,6 +592,139 @@ impl NotepadPool {
             .map(|a| a.len() < NOTEPAD_POOL_CAPACITY)
             .unwrap_or(false)
     }
+
+    fn standby_count(&self) -> usize {
+        self.available
+            .lock()
+            .map(|available| available.len())
+            .unwrap_or(0)
+    }
+}
+
+struct NotepadWebviewCounts {
+    total: usize,
+    visible: usize,
+    standby: usize,
+}
+
+static NOTEPAD_POOL_LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static NOTEPAD_DIAG_START: OnceLock<Instant> = OnceLock::new();
+
+fn notepad_webview_counts(app: &AppHandle) -> NotepadWebviewCounts {
+    let mut total = 0usize;
+    let mut visible = 0usize;
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with("notepad-") {
+            continue;
+        }
+        total += 1;
+        if window.is_visible().unwrap_or(false) {
+            visible += 1;
+        }
+    }
+    let standby = app
+        .try_state::<NotepadPool>()
+        .map(|pool| pool.standby_count())
+        .unwrap_or(0);
+    NotepadWebviewCounts {
+        total,
+        visible,
+        standby,
+    }
+}
+
+fn notepad_diag_ms() -> u128 {
+    NOTEPAD_DIAG_START
+        .get()
+        .map(|start| start.elapsed().as_millis())
+        .unwrap_or(0)
+}
+
+fn write_notepad_pool_line(line: &str) {
+    eprintln!("{line}");
+    if let Ok(mut guard) = NOTEPAD_POOL_LOG.lock() {
+        if let Some(file) = guard.as_mut() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+    }
+}
+
+fn format_notepad_pool_line(event: &str, detail: &str, counts: &NotepadWebviewCounts) -> String {
+    let hidden = counts.total.saturating_sub(counts.visible);
+    format!(
+        "[notepad_pool] +{ms}ms {event} | {detail} | standby={standby}/{cap} visible={visible} hidden={hidden} webviews={total}",
+        ms = notepad_diag_ms(),
+        event = event,
+        detail = detail,
+        standby = counts.standby,
+        cap = NOTEPAD_POOL_CAPACITY,
+        visible = counts.visible,
+        hidden = hidden,
+        total = counts.total,
+    )
+}
+
+fn log_notepad_pool(app: Option<&AppHandle>, event: &str, detail: &str) {
+    let counts = app
+        .map(notepad_webview_counts)
+        .unwrap_or(NotepadWebviewCounts {
+            total: 0,
+            visible: 0,
+            standby: 0,
+        });
+    write_notepad_pool_line(&format_notepad_pool_line(event, detail, &counts));
+}
+
+fn notepad_pool_log_file_path() -> Option<PathBuf> {
+    Some(
+        dirs::data_local_dir()?
+            .join("floral-notepaper")
+            .join("notepad-pool-diag.log"),
+    )
+}
+
+fn init_notepad_pool_diagnostic_logging(mode: &str) {
+    #[cfg(windows)]
+    crate::ensure_console();
+
+    let _ = NOTEPAD_DIAG_START.set(Instant::now());
+
+    let Some(path) = notepad_pool_log_file_path() else {
+        eprintln!("[notepad_pool] mode={mode} | log_file=unavailable");
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            if let Ok(mut guard) = NOTEPAD_POOL_LOG.lock() {
+                *guard = Some(file);
+            }
+            write_notepad_pool_line(&format!(
+                "[notepad_pool] mode={mode}\n[notepad_pool] 日志文件: {}",
+                path.display()
+            ));
+            log_notepad_pool(
+                None,
+                "session_start",
+                &format!("mode={mode} log={}", path.display()),
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "[notepad_pool] mode={mode} | log_file={} err={error}",
+                path.display()
+            );
+        }
+    }
 }
 
 impl RuntimeState {
@@ -1140,6 +1274,7 @@ pub fn setup_desktop(app: &mut App) -> Result<(), Box<dyn Error>> {
     register_configured_global_shortcut(app.handle());
     setup_app_menu(app)?;
     setup_tray(app)?;
+    init_notepad_pool_diagnostic_logging("stage0_diag");
     schedule_notepad_prewarm(app.handle());
 
     if !std::env::args().any(|a| a == "--silent") {
@@ -1431,10 +1566,17 @@ fn open_notepad_window_now(
     bounds: Option<WindowBounds>,
 ) -> Result<String, AppError> {
     if note_id.is_none() {
+        log_notepad_pool(Some(app), "open_try_pool", "phase=activate_pooled");
         if let Some(reused) = activate_pooled_notepad(app, bounds) {
             clear_hidden_window_state(app);
+            log_notepad_pool(
+                Some(app),
+                "open_done",
+                &format!("path=activate label={reused}"),
+            );
             return Ok(reused);
         }
+        log_notepad_pool(Some(app), "open_pool_miss", "phase=open_new");
     }
 
     let locale = configured_locale();
@@ -1445,7 +1587,7 @@ fn open_notepad_window_now(
         None => "index.html?view=notepad".to_string(),
     };
 
-    open_or_focus_window(
+    let opened = open_or_focus_window(
         app,
         &label,
         WindowOpenOptions {
@@ -1458,12 +1600,24 @@ fn open_notepad_window_now(
             skip_taskbar: true,
             bounds,
         },
-    )
+    )?;
+
+    if note_id.is_none() {
+        log_notepad_pool(Some(app), "open_new", &format!("label={opened}"));
+        log_notepad_pool(
+            Some(app),
+            "open_done",
+            &format!("path=open_new label={opened}"),
+        );
+    }
+
+    Ok(opened)
 }
 
 fn activate_pooled_notepad(app: &AppHandle, bounds: Option<WindowBounds>) -> Option<String> {
     let pool = app.try_state::<NotepadPool>()?;
     let label = pool.take()?;
+    log_notepad_pool(Some(app), "activate_take", &format!("label={label}"));
     let window = app.get_webview_window(&label)?;
     let locale = configured_locale();
 
@@ -1477,6 +1631,7 @@ fn activate_pooled_notepad(app: &AppHandle, bounds: Option<WindowBounds>) -> Opt
 
     schedule_notepad_replenish(app, 100);
 
+    log_notepad_pool(Some(app), "activate_pooled", &format!("label={label}"));
     Some(label)
 }
 
@@ -1496,6 +1651,13 @@ pub fn recycle_notepad_window(app: &AppHandle, label: &str) -> Result<(), AppErr
 
     if !recycled {
         window.close()?;
+        log_notepad_pool(
+            Some(app),
+            "recycle_closed",
+            &format!("label={label} reason=pool_full"),
+        );
+    } else {
+        log_notepad_pool(Some(app), "recycle_pooled", &format!("label={label}"));
     }
 
     Ok(())
@@ -1541,6 +1703,11 @@ fn schedule_notepad_prewarm(app: &AppHandle) {
 }
 
 fn schedule_notepad_replenish(app: &AppHandle, delay_ms: u64) {
+    log_notepad_pool(
+        Some(app),
+        "replenish_schedule",
+        &format!("delay_ms={delay_ms}"),
+    );
     let handle = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -1561,6 +1728,7 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
     })?;
 
     if !pool.is_below_capacity() {
+        log_notepad_pool(Some(app), "prewarm_skip", "reason=pool_at_capacity");
         return Ok(());
     }
 
@@ -1587,7 +1755,12 @@ fn prewarm_notepad(app: &AppHandle) -> Result<(), AppError> {
     .focused(false)
     .build()?;
 
-    pool.put(label);
+    let put_ok = pool.put(label.clone());
+    if put_ok {
+        log_notepad_pool(Some(app), "prewarm_ok", &format!("label={label}"));
+    } else {
+        log_notepad_pool(Some(app), "prewarm_put_fail", &format!("label={label}"));
+    }
 
     Ok(())
 }
@@ -1929,6 +2102,7 @@ fn setup_global_shortcut_plugin(app: &AppHandle) -> tauri::Result<()> {
                         }
                     }
                     ShortcutAction::OpenNotepad => {
+                        log_notepad_pool(Some(app), "shortcut_open_pressed", "action=open_notepad");
                         let bounds = if load_config().map(|c| c.open_at_cursor).unwrap_or(true) {
                             let specs = saved_surface_specs(app);
                             cursor_centered_bounds(&specs)
